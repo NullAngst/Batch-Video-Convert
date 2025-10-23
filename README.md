@@ -88,19 +88,26 @@ move: (Safe) Converts the file, then moves the original to a backup folder.
 -m <path>: Move
 The backup folder where original files are sent. You only use this if you set -a move.
 
+-h <HW>: Hardware Acceleration
+Will utilize GPU for decoding video, then pass to CPU to encode as to maintain target bitrate/size.
+
 Example Commands
 
-1. Dry Run (Recommended First) This command will just look in your /mnt/movies folder and tell you what it plans to do.
+1. Dry Run (Recommended First.) This command will just look in your /mnt/movies folder and tell you what it plans to do.
 Bash
 
 `bash convert_videos.sh -d "/mnt/movies" -a dryrun`
 
-2. Convert & Delete This will find, convert, and permanently delete the originals in your "New Volume" folder.
+2. Convert & Delete. This will find, convert, and permanently delete the originals in your "New Volume" folder.
 Bash
 
 `bash convert_videos.sh -d "/mnt/movies" -a delete`
 
-3. Convert & Move (Recommended Action) This will convert everything in /mnt/movies and move the large originals to /mnt/originals_backup.
+3. Convert & Move (Recommended Action.) This will convert everything in /mnt/movies and move the large originals to /mnt/originals_backup.
 Bash
 
 `bash convert_videos.sh -d "/mnt/movies" -a move -m "/mnt/originals_backup"`
+
+4. Convert & Move again but with HW acceleration (Can use on delete as well)
+
+`bash video_convert.sh -d "/mnt/original" -a move -m "/mnt/original" -h amd`
