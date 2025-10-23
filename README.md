@@ -74,8 +74,6 @@ It "borrows" bits from the "cheap" talking-head scenes (giving them just enough 
 
 - dryrun: Does nothing except print what it would have done.
 
-- Repeat: It then moves to the next file in its list and does the whole process again.
-
 # The Flags
 
 -d <path>: Directory
