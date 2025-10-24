@@ -2,9 +2,9 @@
 set -eo pipefail
 
 # --- Configuration ---
-# File size limit (20 GiB). Files *over* this size will be processed.
-# (20 * 1024 * 1024 * 1024)
-SIZE_LIMIT_BYTES=21474836480
+# File size limit (21 GiB). Files *over* this size (21 GiB or larger) will be processed.
+# (21 * 1024 * 1024 * 1024) - 1 byte
+SIZE_LIMIT_BYTES=22548578303
 
 # Target file size (15 GiB).
 # (15 * 1024 * 1024 * 1024)
@@ -12,7 +12,7 @@ TARGET_SIZE_BYTES=16106127360
 TARGET_SIZE_BITS=$((TARGET_SIZE_BYTES * 8))
 
 # FFMPEG settings
-VIDEO_CODEC="libx265" # use CPU for final encode for quality
+VIDEO_CODEC="libx265" # We still use CPU for final encode for quality
 PRESET="medium"       # 'medium' is a good balance. 'slow' is smaller but much slower.
 # Fallback bitrate (in BPS) for audio/subs if not detected (e.g., TrueHD)
 # 8,000,000 bps = 8000 kbps (a very safe buffer for HD audio)
@@ -165,49 +165,123 @@ find "$SEARCH_DIR" -type f -size +${SIZE_LIMIT_BYTES}c \( -iname "*.mkv" -o -ina
     fi
     echo "  - Total audio/sub bitrate: $((OTHER_BITRATE / 1000))k"
 
-    # 3. Set HW-Accel flags and Scaling filter
+    # 3. Set HW-Accel flags, Scaling, and HDR Tonemapping
     SOURCE_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=s=x:p=0 "$file")
     
-    HW_DECODE_FLAGS=()
-    SCALE_CHAIN=""
+    # --- HDR Detection ---
+    IS_HDR=0
+    COLOR_TRANSFER=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of csv=s=x:p=0 "$file")
+    if [[ "$COLOR_TRANSFER" == "smpte2084" || "$COLOR_TRANSFER" == "arib-std-b67" ]]; then
+        IS_HDR=1
+        echo "  - HDR (PQ/HLG) detected. Will tonemap to SDR BT.709."
+    else
+        echo "  - SDR detected. No tonemapping needed."
+    fi
+    # --- End HDR Detection ---
 
-    if [[ "$HW_TYPE" == "intel" ]]; then
+    HW_DECODE_FLAGS=()
+    SCALE_CHAIN="" # This will be our filter chain string
+
+    case "$HW_TYPE" in
+      "intel")
         HW_DECODE_FLAGS=("-hwaccel" "qsv" "-c:v" "hevc_qsv")
-        if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-            echo "  - Using Intel QSV for decode and 1080p scaling."
-            SCALE_CHAIN="scale_qsv=w=-2:h=1080"
-        else
-            echo "  - Using Intel QSV for decode. No scaling needed."
+        if [[ "$IS_HDR" -eq 1 ]]; then
+            # Tonemap in QSV, then scale.
+            SCALE_CHAIN="tonemap_qsv=format=p010" 
+            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
+                echo "  - Using Intel QSV for HDR->SDR tonemapping and 1080p scaling."
+                SCALE_CHAIN+=",scale_qsv=w=-2:h=1080"
+            else
+                echo "  - Using Intel QSV for HDR->SDR tonemapping. No scaling needed."
+            fi
+            SCALE_CHAIN+=",hwdownload,format=yuv420p" # Download and convert to 8-bit yuv420p for libx265
+        else # SDR
+            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
+                echo "  - Using Intel QSV for 1080p scaling."
+                SCALE_CHAIN="scale_qsv=w=-2:h=1080,hwdownload,format=yuv420p"
+            else
+                echo "  - Using Intel QSV for decode. No scaling needed."
+                SCALE_CHAIN="hwdownload,format=yuv420p" # Need to download from QSV surface
+            fi
         fi
-    
-    elif [[ "$HW_TYPE" == "amd" ]]; then
+        ;;
+
+      "amd")
         HW_DECODE_FLAGS=("-hwaccel" "vaapi" "-hwaccel_output_format" "vaapi")
-        if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-            echo "  - Using AMD VAAPI for decode and 1080p scaling."
-            SCALE_CHAIN="scale_vaapi=w=-2:h=1080,hwdownload,format=yuv420p"
+        if [[ "$IS_HDR" -eq 1 ]]; then
+            SCALE_CHAIN="tonemap_vaapi=format=nv12" # Tonemap to 8-bit NV12
+            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
+                echo "  - Using AMD VAAPI for HDR->SDR tonemapping and 1080p scaling."
+                SCALE_CHAIN+=",scale_vaapi=w=-2:h=1080"
+            else
+                echo "  - Using AMD VAAPI for HDR->SDR tonemapping. No scaling needed."
+            fi
+        else # SDR
+            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
+                echo "  - Using AMD VAAPI for 1080p scaling."
+                SCALE_CHAIN="scale_vaapi=w=-2:h=1080"
+            else
+                echo "  - Using AMD VAAPI for decode. No scaling needed."
+            fi
+        fi
+        # Add the final download and format for libx265 to *all* VAAPI chains
+        if [[ -n "$SCALE_CHAIN" ]]; then
+            SCALE_CHAIN+=",hwdownload,format=yuv420p"
         else
-            echo "  - Using AMD VAAPI for decode. No scaling needed."
+            SCALE_CHAIN="hwdownload,format=yuv420p" # Just download if no scaling or tonemapping
+        fi
+        ;;
+
+      "nvidia")
+        HW_DECODE_FLAGS=("-hwaccel" "cuda" "-c:v" "hevc_cuvid")
+        if [[ "$IS_HDR" -eq 1 ]]; then
+            # CUDA tonemapping. 'hable' is a good algorithm. format=yuv420p output is 8-bit.
+            SCALE_CHAIN="tonemap_cuda=tonemap=hable:format=yuv420p" 
+            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
+                echo "  - Using Nvidia CUDA for HDR->SDR tonemapping and 1080p scaling."
+                SCALE_CHAIN+=",scale_cuda=w=-2:h=1080"
+            else
+                echo "  - Using Nvidia CUDA for HDR->SDR tonemapping. No scaling needed."
+            fi
+        else # SDR
+            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
+                echo "  - Using Nvidia CUDA for 1080p scaling."
+                SCALE_CHAIN="scale_cuda=w=-2:h=1080"
+            else
+                echo "  - Using Nvidia CUDA for decode. No scaling needed."
+            fi
+        fi
+        # Add the final download and format for libx265
+        if [[ -n "$SCALE_CHAIN" ]]; then
+            # if we tonemapped, we are already yuv420p. if we scaled, we are not.
+            # this ensures the output is always correct for libx265
+            SCALE_CHAIN+=",hwdownload,format=yuv420p"
+        else
             SCALE_CHAIN="hwdownload,format=yuv420p"
         fi
-    
-    elif [[ "$HW_TYPE" == "nvidia" ]]; then
-        HW_DECODE_FLAGS=("-hwaccel" "cuda" "-c:v" "hevc_cuvid")
-        if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-            echo "  - Using Nvidia CUDA for decode and 1080p scaling."
-            SCALE_CHAIN="scale_cuda=w=-2:h=1080,hwdownload,format=yuv420p"
-        else
-            echo "  - Using Nvidia CUDA for decode. No scaling needed."
-            SCALE_CHAIN="hwdownload,format=yuv4G"
-        fi
+        ;;
 
-    else # No HW-Accel (CPU only)
-        if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-            echo "  - Using CPU for 1080p scaling."
-            SCALE_CHAIN="scale=-2:1080"
-        else
-            echo "  - No scaling needed."
+      *) # No HW-Accel (CPU only)
+        if [[ "$IS_HDR" -eq 1 ]]; then
+            # Use libplacebo for high-quality CPU tonemapping
+            SCALE_CHAIN="vf_libplacebo=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
+            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
+                echo "  - Using CPU (libplacebo) for HDR->SDR tonemapping and 1080p scaling."
+                SCALE_CHAIN+=",scale=-2:1080"
+            else
+                echo "  - Using CPU (libplacebo) for HDR->SDR tonemapping. No scaling needed."
+            fi
+        else # SDR
+            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
+                echo "  - Using CPU for 1080p scaling."
+                SCALE_CHAIN="scale=-2:1080"
+            else
+                echo "  - No scaling needed."
+            fi
         fi
-    fi
+        ;;
+    esac
+
 
     # 4. Calculate target video bitrate
     TARGET_VIDEO_BITS=$((TARGET_SIZE_BITS - (OTHER_BITRATE * DURATION_S)))
@@ -242,8 +316,6 @@ find "$SEARCH_DIR" -type f -size +${SIZE_LIMIT_BYTES}c \( -iname "*.mkv" -o -ina
     )
 
     # Output options
-    # FIX: Changed -map 0 to be specific and avoid filtering/copying
-    # the extra video stream (cover art).
     FFMPEG_OUTPUT_ARGS=(
         "-c:v" "$VIDEO_CODEC"   # Set video encoder to libx265
         "-preset" "$PRESET"       # Set CPU encode preset
