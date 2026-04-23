@@ -1,406 +1,492 @@
 #!/bin/bash
-set -eo pipefail
+#
+# Interactive FFmpeg Transcoder Script (SDR ONLY)
+#
+# Interactively prompts for settings, then scans a directory for large
+# video files to transcode to HEVC/H.265. Processes ONLY SDR files and
+# SKIPS ALL HDR files, logging them for manual conversion (e.g., Handbrake).
+#
+# Usage: ./Interactive_Media_Transcoder.sh [--dry-run] [--help]
+#
+# --- Version 7 ---
+# - Added --dry-run and --help flags.
+# - Fixed VAAPI hwaccel_output_format (must be 'vaapi', not 'yuv420p').
+# - Fixed NVIDIA filter chain to stay on GPU surface correctly.
+# - Replaced unsafe eval tilde expansion with parameter substitution.
+# - Added set -uo pipefail for stricter error handling.
+# - Added trap for Ctrl+C cleanup of in-progress temp files.
+# - Added numeric validation for RF value.
+# - Added per-file elapsed time reporting.
+# - Added final summary (processed / skipped-HDR / skipped-exists / failed).
+# - HDR log now deduplicates entries.
+# - Added startup validation of all output directories (writable check).
+# - Added -map_chapters 0 to preserve chapters.
+# - Used conditional audio/subtitle mapping to avoid errors on streams that
+#   may not exist.
 
-# --- Configuration ---
-# File size limit (21 GiB). Files *over* this size (21 GiB or larger) will be processed.
-# (21 * 1024 * 1024 * 1024) - 1 byte
-SIZE_LIMIT_BYTES=22548578303
+# --- Strict mode (safe variant — pipefail is set but the find|while loop
+#     uses a process substitution to avoid the last-pipe-exit-code problem) ---
+set -uo pipefail
 
-# Target file size (15 GiB).
-# (15 * 1024 * 1024 * 1024)
-TARGET_SIZE_BYTES=16106127360
-TARGET_SIZE_BITS=$((TARGET_SIZE_BYTES * 8))
-
-# FFMPEG settings
-VIDEO_CODEC="libx265" # We still use CPU for final encode for quality
-PRESET="medium"       # 'medium' is a good balance. 'slow' is smaller but much slower.
-# Fallback bitrate (in BPS) for audio/subs if not detected (e.g., TrueHD)
-# 8,000,000 bps = 8000 kbps (a very safe buffer for HD audio)
-FALLBACK_OTHER_BITRATE=8000000 
-
-
-# --- Helper Functions ---
-function check_deps {
-    if ! command -v ffmpeg &> /dev/null; then
-        echo "Error: ffmpeg is not installed. Please install it." >&2
-        exit 1
-    fi
-    if ! command -v ffprobe &> /dev/null; then
-        echo "Error: ffprobe is not installed. Please install it (it usually comes with ffmpeg)." >&2
-        exit 1
-    fi
-}
-
-function print_usage {
-    echo "Usage: $0 -d <search_directory> -a <action> [-m <move_directory>] [-h <intel|amd|nvidia>]"
-    echo ""
-    echo "Flags:"
-    echo "  -d <path>    (Required) The directory to search recursively."
-    echo "  -a <action>  (Required) The action to perform."
-    echo "               Actions: 'delete', 'move', 'dryrun'"
-    echo "  -m <path>    (Required if action is 'move') The destination for original files."
-    echo "  -h <type>    (Optional) Hardware acceleration for decode/scale."
-    echo "               Types: 'intel' (QSV), 'amd' (VAAPI), 'nvidia' (CUDA)"
-    echo ""
-    echo "Example (Intel QSV Hybrid):"
-    echo "  $0 -d /mnt/movies -a delete -h intel"
-    echo ""
-    echo "Example (AMD VAAPI Hybrid):"
-    echo "  $0 -d /mnt/movies -a delete -h amd"
-    echo ""
-    echo "Example (Nvidia CUDA Hybrid):"
-    echo "  $0 -d /mnt/movies -a delete -h nvidia"
-}
-
-# --- Argument Validation ---
-SEARCH_DIR=""
+# --- Globals ---
+TARGET_DIR=""
 ACTION=""
-MOVE_DIR=""
+MOVE_PATH=""
 HW_TYPE=""
+RF_VALUE=""
+TARGET_H=""
+MIN_SIZE_GB=""
+TRANSCODE_PATH=""
+WORK_IN_PROGRESS_PATH=""
+FINAL_OUTPUT_DIR=""
+HDR_LOG_FILE=""
 
-while getopts "d:a:m:h:" opt; do
-  case $opt in
-    d) SEARCH_DIR="$OPTARG" ;;
-    a) ACTION="$OPTARG" ;;
-    m) MOVE_DIR="$OPTARG" ;;
-    h) HW_TYPE="$OPTARG" ;; # -h for hardware
-    \?)
-      echo "Invalid option: -$OPTARG" >&2
-      print_usage
-      exit 1
-      ;;
-    :)
-      echo "Option -$OPTARG requires an argument." >&2
-      print_usage
-      exit 1
-      ;;
-  esac
-done
+VCODEC="libx265"
+HW_OPTS=""
+QUALITY_OPTS=""
+VF_STRING=""
+X265_PARAMS=""
 
-if [[ -z "$SEARCH_DIR" || ! -d "$SEARCH_DIR" ]]; then
-    echo "Error: Please provide a valid search directory with -d." >&2
-    print_usage
-    exit 1
-fi
+DRY_RUN=false
 
-if [[ "$ACTION" != "delete" && "$ACTION" != "move" && "$ACTION" != "dryrun" ]]; then
-    echo "Error: Invalid action with -a. Must be 'delete', 'move', or 'dryrun'." >&2
-    print_usage
-    exit 1
-fi
+# Counters for final summary
+COUNT_PROCESSED=0
+COUNT_HDR=0
+COUNT_SKIPPED=0
+COUNT_FAILED=0
 
-if [[ "$ACTION" == "move" ]]; then
-    if [[ -z "$MOVE_DIR" ]]; then
-        echo "Error: 'move' action requires a move directory with -m." >&2
-        print_usage
-        exit 1
-    fi
-    if ! mkdir -p "$MOVE_DIR"; then
-        echo "Error: Could not create move directory '$MOVE_DIR'." >&2
-        exit 1
-    fi
-    MOVE_DIR=$(realpath "$MOVE_DIR") # Get absolute path
-fi
+# Track current temp file for trap cleanup
+CURRENT_TEMP_FILE=""
 
-if [[ "$HW_TYPE" != "" && "$HW_TYPE" != "intel" && "$HW_TYPE" != "amd" && "$HW_TYPE" != "nvidia" ]]; then
-    echo "Error: Invalid hardware type with -h. Must be 'intel', 'amd', or 'nvidia'." >&2
-    print_usage
-    exit 1
-fi
-
-# --- Main Script ---
-check_deps
-
-echo "Starting video conversion process..."
-echo "  Search Directory: $SEARCH_DIR"
-echo "  Action: $ACTION"
-[[ "$ACTION" == "move" ]] && echo "  Move Originals To: $MOVE_DIR"
-[[ "$HW_TYPE" != "" ]] && echo "  Hardware Acceleration: $HW_TYPE" || echo "  Hardware Acceleration: None (CPU only)"
-echo "  Finding files larger than $(($SIZE_LIMIT_BYTES / 1024 / 1024 / 1024)) GiB..."
-
-# Find files, print null-terminated, and pipe to 'while read' loop
-find "$SEARCH_DIR" -type f -size +${SIZE_LIMIT_BYTES}c \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" \) -print0 | while IFS= read -r -d '' file; do
-    echo "-------------------------------------"
-    echo "Processing file: $file"
-
-    # --- Define file paths and log file location ---
-    DIRNAME=$(dirname "$file")
-    FILENAME=$(basename "$file")
-    EXTENSION="${FILENAME##*.}"
-    BASENAME="${FILENAME%.*}"
-    OUTPUT_FILE="${DIRNAME}/${BASENAME}_15GB.${EXTENSION}"
-    
-    LOG_FILE_BASE="${DIRNAME}/${BASENAME}_ffmpeg2pass"
-    
-    echo "  - Output file: $OUTPUT_FILE"
-    echo "  - Log files: ${LOG_FILE_BASE}-0.log"
-
-    # --- Start Probing File ---
-    
-    ORIG_SIZE_BYTES_RAW=$(stat -c%s "$file")
-    ORIG_SIZE_GB=$(awk "BEGIN {print $ORIG_SIZE_BYTES_RAW / 1024 / 1024 / 1024}")
-    echo "  - Original size: $(printf "%.2f" $ORIG_SIZE_GB) GiB"
-
-    # 1. Get duration
-    DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$file")
-    if [[ -z "$DURATION" ]]; then
-        echo "  - ERROR: Could not get video duration. Skipping."
-        continue
-    fi
-    DURATION_S=$(printf "%.0f" "$DURATION")
-    echo "  - Duration: $DURATION_S seconds"
-
-    # 2. Get audio/sub bitrate
-    AUDIO_BITRATE=$(ffprobe -v error -select_streams a -show_entries stream=bit_rate -of csv=s=x:p=0 "$file" | awk '{s+=$1} END {print s}')
-    SUB_BITRATE=$(ffprobe -v error -select_streams s -show_entries stream=bit_rate -of csv=s=x:p=0 "$file" | awk '{s+=$1} END {print s}')
-    [[ -z "$AUDIO_BITRATE" ]] && AUDIO_BITRATE=0
-    [[ -z "$SUB_BITRATE" ]] && SUB_BITRATE=0
-    
-    OTHER_BITRATE=$((AUDIO_BITRATE + SUB_BITRATE))
-
-    if [[ "$OTHER_BITRATE" -eq 0 ]]; then
-        echo "  - WARNING: Could not detect audio/sub bitrate (may be PCM/TrueHD)."
-        echo "  - Applying a $FALLBACK_OTHER_BITRATE bps safety buffer."
-        OTHER_BITRATE=$FALLBACK_OTHER_BITRATE
-    fi
-    echo "  - Total audio/sub bitrate: $((OTHER_BITRATE / 1000))k"
-
-    # 3. Set HW-Accel flags, Scaling, and HDR Tonemapping
-    SOURCE_HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=s=x:p=0 "$file")
-    
-    # --- HDR Detection ---
-    IS_HDR=0
-    COLOR_TRANSFER=$(ffprobe -v error -select_streams v:0 -show_entries stream=color_transfer -of csv=s=x:p=0 "$file")
-    if [[ "$COLOR_TRANSFER" == "smpte2084" || "$COLOR_TRANSFER" == "arib-std-b67" ]]; then
-        IS_HDR=1
-        echo "  - HDR (PQ/HLG) detected. Will tonemap to SDR BT.709."
-    else
-        echo "  - SDR detected. No tonemapping needed."
-    fi
-    # --- End HDR Detection ---
-
-    HW_DECODE_FLAGS=()
-    SCALE_CHAIN="" # This will be our filter chain string
-
-    case "$HW_TYPE" in
-      "intel")
-        HW_DECODE_FLAGS=("-hwaccel" "qsv" "-c:v" "hevc_qsv")
-        if [[ "$IS_HDR" -eq 1 ]]; then
-            # Tonemap in QSV, then scale.
-            SCALE_CHAIN="tonemap_qsv=format=p010" 
-            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-                echo "  - Using Intel QSV for HDR->SDR tonemapping and 1080p scaling."
-                SCALE_CHAIN+=",scale_qsv=w=-2:h=1080"
-            else
-                echo "  - Using Intel QSV for HDR->SDR tonemapping. No scaling needed."
-            fi
-            SCALE_CHAIN+=",hwdownload,format=yuv420p" # Download and convert to 8-bit yuv420p for libx265
-        else # SDR
-            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-                echo "  - Using Intel QSV for 1080p scaling."
-                SCALE_CHAIN="scale_qsv=w=-2:h=1080,hwdownload,format=yuv420p"
-            else
-                echo "  - Using Intel QSV for decode. No scaling needed."
-                SCALE_CHAIN="hwdownload,format=yuv420p" # Need to download from QSV surface
-            fi
-        fi
-        ;;
-
-      "amd")
-        HW_DECODE_FLAGS=("-hwaccel" "vaapi" "-hwaccel_output_format" "vaapi")
-        if [[ "$IS_HDR" -eq 1 ]]; then
-            SCALE_CHAIN="tonemap_vaapi=format=nv12" # Tonemap to 8-bit NV12
-            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-                echo "  - Using AMD VAAPI for HDR->SDR tonemapping and 1080p scaling."
-                SCALE_CHAIN+=",scale_vaapi=w=-2:h=1080"
-            else
-                echo "  - Using AMD VAAPI for HDR->SDR tonemapping. No scaling needed."
-            fi
-        else # SDR
-            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-                echo "  - Using AMD VAAPI for 1080p scaling."
-                SCALE_CHAIN="scale_vaapi=w=-2:h=1080"
-            else
-                echo "  - Using AMD VAAPI for decode. No scaling needed."
-            fi
-        fi
-        # Add the final download and format for libx265 to *all* VAAPI chains
-        if [[ -n "$SCALE_CHAIN" ]]; then
-            SCALE_CHAIN+=",hwdownload,format=yuv420p"
-        else
-            SCALE_CHAIN="hwdownload,format=yuv420p" # Just download if no scaling or tonemapping
-        fi
-        ;;
-
-      "nvidia")
-        HW_DECODE_FLAGS=("-hwaccel" "cuda" "-c:v" "hevc_cuvid")
-        if [[ "$IS_HDR" -eq 1 ]]; then
-            # CUDA tonemapping. 'hable' is a good algorithm. format=yuv420p output is 8-bit.
-            SCALE_CHAIN="tonemap_cuda=tonemap=hable:format=yuv420p" 
-            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-                echo "  - Using Nvidia CUDA for HDR->SDR tonemapping and 1080p scaling."
-                SCALE_CHAIN+=",scale_cuda=w=-2:h=1080"
-            else
-                echo "  - Using Nvidia CUDA for HDR->SDR tonemapping. No scaling needed."
-            fi
-        else # SDR
-            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-                echo "  - Using Nvidia CUDA for 1080p scaling."
-                SCALE_CHAIN="scale_cuda=w=-2:h=1080"
-            else
-                echo "  - Using Nvidia CUDA for decode. No scaling needed."
-            fi
-        fi
-        # Add the final download and format for libx265
-        if [[ -n "$SCALE_CHAIN" ]]; then
-            # if we tonemapped, we are already yuv420p. if we scaled, we are not.
-            # this ensures the output is always correct for libx265
-            SCALE_CHAIN+=",hwdownload,format=yuv420p"
-        else
-            SCALE_CHAIN="hwdownload,format=yuv420p"
-        fi
-        ;;
-
-      *) # No HW-Accel (CPU only)
-        if [[ "$IS_HDR" -eq 1 ]]; then
-            # Use libplacebo for high-quality CPU tonemapping
-            SCALE_CHAIN="vf_libplacebo=colorspace=bt709:color_primaries=bt709:color_trc=bt709"
-            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-                echo "  - Using CPU (libplacebo) for HDR->SDR tonemapping and 1080p scaling."
-                SCALE_CHAIN+=",scale=-2:1080"
-            else
-                echo "  - Using CPU (libplacebo) for HDR->SDR tonemapping. No scaling needed."
-            fi
-        else # SDR
-            if [[ "$SOURCE_HEIGHT" -gt 1080 ]]; then
-                echo "  - Using CPU for 1080p scaling."
-                SCALE_CHAIN="scale=-2:1080"
-            else
-                echo "  - No scaling needed."
-            fi
-        fi
-        ;;
+# --- Parse CLI Flags ---
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)
+            DRY_RUN=true
+            echo "*** DRY RUN MODE: No files will be moved, deleted, or transcoded. ***"
+            ;;
+        --help|-h)
+            echo "Usage: $0 [--dry-run] [--help]"
+            echo ""
+            echo "  --dry-run   Show what would be processed without changing anything."
+            echo "  --help      Show this help message."
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            echo "Use --help for usage." >&2
+            exit 1
+            ;;
     esac
-
-
-    # 4. Calculate target video bitrate
-    TARGET_VIDEO_BITS=$((TARGET_SIZE_BITS - (OTHER_BITRATE * DURATION_S)))
-    TARGET_VIDEO_BPS=$((TARGET_VIDEO_BITS / DURATION_S))
-    TARGET_VIDEO_BPS_K=$((TARGET_VIDEO_BPS / 1000))
-
-    if [[ "$TARGET_VIDEO_BPS" -le 0 ]]; then
-        echo "  - ERROR: Calculated target bitrate is zero or negative (safety buffer may be too high). Skipping."
-        continue
-    fi
-    echo "  - Target video bitrate: ${TARGET_VIDEO_BPS_K}k"
-
-    if [[ "$ACTION" == "dryrun" ]]; then
-        echo "  [DRY RUN] Would convert this file. Skipping."
-        continue
-    fi
-
-    # 5. Run 2-Pass FFMPEG
-    
-    # --- Build FFMPEG Command Arrays ---
-    
-    # Base options
-    FFMPEG_BASE_ARGS=(
-        "-y"                # Overwrite output without asking
-        "-nostdin"          # Disable interactive input
-    )
-    
-    # Input options
-    FFMPEG_INPUT_ARGS=(
-        "${HW_DECODE_FLAGS[@]}" # Add hw-accel flags (if any)
-        "-i" "$file"        # Set input file
-    )
-
-    # Output options
-    FFMPEG_OUTPUT_ARGS=(
-        "-c:v" "$VIDEO_CODEC"   # Set video encoder to libx265
-        "-preset" "$PRESET"       # Set CPU encode preset
-        "-b:v" "$TARGET_VIDEO_BPS" # Set target video bitrate
-        "-map" "0:v:0"          # Map ONLY the first video stream
-        "-map" "0:a?"           # Map all audio streams (if any)
-        "-map" "0:s?"           # Map all subtitle streams (if any)
-        "-c:a" "copy"           # Copy audio streams
-        "-c:s" "copy"           # Copy subtitle streams
-    )
-
-    # Build scale filter args array
-    SCALE_ARGS=()
-    if [[ -n "$SCALE_CHAIN" ]]; then
-      SCALE_ARGS=("-vf" "$SCALE_CHAIN")
-    fi
-
-    # --- Pass 1: Analysis ---
-    echo "  - Starting Pass 1 (Hybrid Mode)..."
-    
-    # Pass 1 specific args
-    PASS1_ARGS=(
-        "-pass" "1"
-        "-passlogfile" "$LOG_FILE_BASE"
-        "-f" "matroska"
-        "/dev/null"
-    )
-
-    if ! ffmpeg "${FFMPEG_BASE_ARGS[@]}" \
-                "${FFMPEG_INPUT_ARGS[@]}" \
-                "${FFMPEG_OUTPUT_ARGS[@]}" \
-                "${SCALE_ARGS[@]}" \
-                "${PASS1_ARGS[@]}"; then
-        
-        echo "  - ERROR: FFMPEG Pass 1 failed. Check logs."
-        rm -f "${LOG_FILE_BASE}-0.log" "${LOG_FILE_BASE}-0.log.mbtree"
-        continue
-    fi
-    echo "  - Pass 1 complete."
-
-
-    # --- Pass 2: Encoding ---
-    echo "  - Starting Pass 2 (Hybrid Mode)..."
-    
-    # Pass 2 specific args
-    PASS2_ARGS=(
-        "-pass" "2"
-        "-passlogfile" "$LOG_FILE_BASE"
-        "$OUTPUT_FILE"
-    )
-
-    if ! ffmpeg "${FFMPEG_BASE_ARGS[@]}" \
-                "${FFMPEG_INPUT_ARGS[@]}" \
-                "${FFMPEG_OUTPUT_ARGS[@]}" \
-                "${SCALE_ARGS[@]}" \
-                "${PASS2_ARGS[@]}"; then
-
-        echo "  - ERROR: FFMPEG Pass 2 failed. Check logs."
-        echo "  - Deleting incomplete output file: $OUTPUT_FILE"
-        rm -f "$OUTPUT_FILE"
-        rm -f "${LOG_FILE_BASE}-0.log" "${LOG_FILE_BASE}-0.log.mbtree"
-        continue
-    fi
-    echo "  - Pass 2 complete. New file created."
-
-    # 6. Verify new file and perform action
-    if [[ -f "$OUTPUT_FILE" && $(stat -c%s "$OUTPUT_FILE") -gt 1024 ]]; then
-        echo "  - New file verified."
-        
-        if [[ "$ACTION" == "delete" ]]; then
-            echo "  - Deleting original file: $file"
-            rm -f "$file"
-        elif [[ "$ACTION" == "move" ]]; then
-            echo "  - Moving original file to: $MOVE_DIR"
-            mv -f "$file" "$MOVE_DIR/"
-        fi
-    else
-        echo "  - ERROR: New file '$OUTPUT_FILE' seems empty or invalid. Not touching original."
-    fi
-
-    # Clean up log files
-    rm -f "${LOG_FILE_BASE}-0.log" "${LOG_FILE_BASE}-0.log.mbtree"
-
 done
 
-echo "-------------------------------------"
-echo "All processing complete."
+# --- Trap: Clean up temp file on Ctrl+C or SIGTERM ---
+cleanup() {
+    echo ""
+    echo "Interrupted. Cleaning up..."
+    if [ -n "$CURRENT_TEMP_FILE" ] && [ -f "$CURRENT_TEMP_FILE" ]; then
+        echo "Removing incomplete temp file: $CURRENT_TEMP_FILE"
+        rm -f "$CURRENT_TEMP_FILE"
+    fi
+    echo "Exiting."
+    exit 1
+}
+trap cleanup INT TERM
 
+# --- Helper: Yes/No Prompt ---
+ask_yes_no() {
+    local prompt="$1"
+    local default="$2"
+    local response
+
+    if [ "$default" = "Y" ]; then
+        read -rp "$prompt (Y/n): " response
+    else
+        read -rp "$prompt (y/N): " response
+    fi
+    response="${response:-$default}"
+
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
+# --- Helper: Ask for an Existing Directory ---
+ask_for_dir() {
+    local prompt="$1"
+    local var_name="$2"
+    local dir_path=""
+
+    while true; do
+        read -rp "$prompt: " dir_path
+        # Safe tilde expansion (no eval)
+        dir_path="${dir_path/#\~/$HOME}"
+        # Strip trailing slash
+        dir_path="${dir_path%/}"
+
+        if [ -d "$dir_path" ]; then
+            # Check it's writable (unless dry run)
+            if [ "$DRY_RUN" = false ] && [ ! -w "$dir_path" ]; then
+                echo "Error: Directory '$dir_path' is not writable. Please choose another." >&2
+                continue
+            fi
+            printf -v "$var_name" '%s' "$dir_path"
+            break
+        else
+            echo "Error: Directory not found: '$dir_path'. Please try again." >&2
+        fi
+    done
+}
+
+# --- Helper: Validate Integer ---
+ask_for_int() {
+    local prompt="$1"
+    local default="$2"
+    local var_name="$3"
+    local value=""
+
+    while true; do
+        read -rp "$prompt (Default $default): " value
+        value="${value:-$default}"
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+            printf -v "$var_name" '%s' "$value"
+            break
+        else
+            echo "Error: Please enter a whole number." >&2
+        fi
+    done
+}
+
+# ===========================================================================
+# --- Interactive Setup ---
+# ===========================================================================
+echo "=============================================="
+echo "   Interactive Media Transcoder Setup (SDR)  "
+echo "=============================================="
+echo ""
+
+# 1. Target Directory
+ask_for_dir "Directory to SCAN for media files" TARGET_DIR
+
+# 2. Action on originals
+if ask_yes_no "Keep the original file after transcoding (move it to an archive)?" "Y"; then
+    ACTION="move"
+    ask_for_dir "Where should original files be MOVED to (archive directory)" MOVE_PATH
+else
+    ACTION="delete"
+    echo "Originals will be DELETED after successful transcoding."
+fi
+
+# 3. Hardware or CPU
+while true; do
+    read -rp "Encoding mode — hardware (hw) or CPU? [hw/cpu, default: cpu]: " hw_choice
+    hw_choice="${hw_choice:-cpu}"
+    hw_choice_lower="${hw_choice,,}"
+
+    if [ "$hw_choice_lower" = "cpu" ]; then
+        HW_TYPE="cpu"
+        break
+    elif [ "$hw_choice_lower" = "hw" ]; then
+        while true; do
+            read -rp "Hardware vendor — amd / intel / nvidia: " hw_specific
+            hw_specific_lower="${hw_specific,,}"
+            case "$hw_specific_lower" in
+                amd|intel|nvidia)
+                    HW_TYPE="$hw_specific_lower"
+                    break 2
+                    ;;
+                *)
+                    echo "Please enter 'amd', 'intel', or 'nvidia'." >&2
+                    ;;
+            esac
+        done
+    else
+        echo "Please enter 'hw' or 'cpu'." >&2
+    fi
+done
+
+# 4. RF / Quality value
+ask_for_int "RF quality value (lower = better quality, larger file; typical range 15-28)" "15" RF_VALUE
+
+# 5. Target resolution height
+read -rp "Target resolution height in pixels, e.g. 720 or 1080 (Default: 720): " TARGET_SIZE_RAW
+TARGET_SIZE_RAW="${TARGET_SIZE_RAW:-720}"
+TARGET_H=$(echo "$TARGET_SIZE_RAW" | grep -oE '[0-9]+' | head -n1)
+echo "Target height: ${TARGET_H}p"
+
+# 6. Minimum file size threshold
+ask_for_int "Minimum file size to process in GB (skip smaller files)" "20" MIN_SIZE_GB
+echo "Only files larger than ${MIN_SIZE_GB} GB will be processed."
+
+# 7. WIP / checkout directory (prevents concurrent processing of the same file)
+if ask_yes_no "Move each file to a 'working' directory before transcoding? (Prevents two instances colliding)" "N"; then
+    ask_for_dir "Working/checkout directory" WORK_IN_PROGRESS_PATH
+fi
+
+# 8. Temporary transcode directory (transcode to fast scratch disk, then move)
+if ask_yes_no "Transcode to a temporary directory first, then move finished file to destination?" "N"; then
+    ask_for_dir "Temporary transcoding directory (scratch space)" TRANSCODE_PATH
+fi
+
+# 9. Final output directory (different from scan directory)
+if ask_yes_no "Place finished (shrunk) files in a directory different from where they were scanned?" "N"; then
+    ask_for_dir "Final output directory for shrunk files" FINAL_OUTPUT_DIR
+fi
+
+# --- HDR Log File ---
+HDR_LOG_FILE="$TARGET_DIR/_HDR_files_to_check.log"
+
+# ===========================================================================
+# --- Build FFmpeg Options ---
+# ===========================================================================
+case "$HW_TYPE" in
+    cpu)
+        VCODEC="libx265"
+        HW_OPTS=""
+        X265_PARAMS="strong-intra-smoothing=0:rect=0:aq-mode=1:rd=4:psy-rd=0.75:psy-rdoq=4.0:rdoq-level=1:rskip=2"
+        QUALITY_OPTS="-crf $RF_VALUE -preset slow -x265-params $X265_PARAMS"
+        VF_STRING="scale=w=-2:h='trunc(min(ih,$TARGET_H)/16)*16',format=yuv420p"
+        echo "Encoder: CPU (libx265), preset slow — best compression."
+        ;;
+    nvidia)
+        VCODEC="hevc_nvenc"
+        # Decode on GPU; keep frames in CUDA memory for scale_cuda
+        HW_OPTS="-hwaccel cuda -hwaccel_output_format cuda"
+        QUALITY_OPTS="-preset p5 -tune hq -cq $RF_VALUE -rc-lookahead 32"
+        # scale_cuda outputs NV12 on CUDA surface; no explicit format needed before encoder
+        VF_STRING="scale_cuda=w=-2:h='trunc(min(ih,$TARGET_H)/16)*16':format=nv12"
+        echo "Encoder: NVIDIA (hevc_nvenc) — fast GPU encoding."
+        ;;
+    intel|amd)
+        VCODEC="hevc_vaapi"
+        # hwaccel_output_format must be 'vaapi' to keep frames on the VAAPI surface
+        HW_OPTS="-hwaccel vaapi -hwaccel_output_format vaapi -vaapi_device /dev/dri/renderD128"
+        QUALITY_OPTS="-qp $RF_VALUE"
+        # Scale in software first (format=nv12), then upload to VAAPI surface
+        VF_STRING="scale=w=-2:h='trunc(min(ih,$TARGET_H)/16)*16',format=nv12,hwupload"
+        echo "Encoder: VAAPI ($HW_TYPE: hevc_vaapi) — fast GPU encoding."
+        ;;
+esac
+echo "HDR files will be SKIPPED and logged."
+echo ""
+
+# ===========================================================================
+# --- Initialize Log File ---
+# ===========================================================================
+if [ "$DRY_RUN" = false ]; then
+    if [ ! -f "$HDR_LOG_FILE" ]; then
+        {
+            echo "# HDR Videos Log — Created $(date)"
+            echo "# These files are HDR and were skipped. Use Handbrake for manual conversion."
+            echo ""
+        } > "$HDR_LOG_FILE"
+        echo "Created HDR log: $HDR_LOG_FILE"
+    fi
+fi
+
+# ===========================================================================
+# --- Print Config Summary ---
+# ===========================================================================
+echo "======================================================"
+echo "  Configuration Summary"
+echo "======================================================"
+echo "  Scan directory  : $TARGET_DIR"
+echo "  Encoder         : $HW_TYPE ($VCODEC)"
+echo "  RF/Quality      : $RF_VALUE"
+echo "  Target height   : ${TARGET_H}p"
+echo "  Min file size   : ${MIN_SIZE_GB} GB"
+echo "  On success      : $ACTION originals"
+[ "$ACTION" = "move" ]        && echo "  Archive path    : $MOVE_PATH"
+[ -n "$WORK_IN_PROGRESS_PATH" ] && echo "  WIP/checkout    : $WORK_IN_PROGRESS_PATH"
+[ -n "$TRANSCODE_PATH" ]        && echo "  Temp transcode  : $TRANSCODE_PATH"
+[ -n "$FINAL_OUTPUT_DIR" ]      && echo "  Final output    : $FINAL_OUTPUT_DIR"
+[ -z "$FINAL_OUTPUT_DIR" ]      && echo "  Final output    : (same as scan directory)"
+echo "  HDR log         : $HDR_LOG_FILE"
+[ "$DRY_RUN" = true ]           && echo "  *** DRY RUN — no changes will be made ***"
+echo "======================================================"
+echo ""
+
+# ===========================================================================
+# --- Main Processing Loop ---
+# ===========================================================================
+# Use process substitution instead of a pipe so the loop runs in the current
+# shell (preserving counter variables) and pipefail doesn't trip on find.
+while IFS= read -r -d '' filepath; do
+
+    echo "------------------------------------------------------"
+    echo "Found: $filepath"
+
+    # --- HDR Detection ---
+    color_transfer=""
+    color_transfer=$(ffprobe -v error \
+        -select_streams v:0 \
+        -show_entries stream=color_transfer \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$filepath" 2>/dev/null || true)
+
+    if [ "$color_transfer" = "smpte2084" ] || [ "$color_transfer" = "arib-std-b67" ]; then
+        echo "  → HDR detected ($color_transfer). Skipping."
+        # Deduplicate log entries
+        if [ "$DRY_RUN" = false ]; then
+            if ! grep -qxF "$filepath" "$HDR_LOG_FILE" 2>/dev/null; then
+                echo "$filepath" >> "$HDR_LOG_FILE"
+            fi
+        fi
+        (( COUNT_HDR++ )) || true
+        continue
+    fi
+    echo "  → SDR ($color_transfer). Proceeding."
+
+    # --- Derive Path Variables ---
+    original_dir=$(dirname "$filepath")
+    filename=$(basename "$filepath")
+    filename_noext="${filename%.*}"
+    output_filename="${filename_noext}_shrunk.mkv"
+
+    # --- Claim File (WIP Move) ---
+    input_for_ffmpeg="$filepath"
+
+    if [ -n "$WORK_IN_PROGRESS_PATH" ]; then
+        wip_filepath="$WORK_IN_PROGRESS_PATH/$filename"
+
+        if [ -f "$wip_filepath" ]; then
+            echo "  → Already in WIP directory. Another process may own it. Skipping."
+            (( COUNT_SKIPPED++ )) || true
+            continue
+        fi
+
+        if [ "$DRY_RUN" = false ]; then
+            echo "  → Claiming: moving to $wip_filepath"
+            if ! mv "$filepath" "$wip_filepath"; then
+                echo "  → Error: Could not move to WIP. Skipping." >&2
+                (( COUNT_SKIPPED++ )) || true
+                continue
+            fi
+        else
+            echo "  [DRY RUN] Would move to WIP: $wip_filepath"
+        fi
+        input_for_ffmpeg="$wip_filepath"
+    fi
+
+    # --- Determine Output Paths ---
+    if [ -n "$FINAL_OUTPUT_DIR" ]; then
+        final_output_path="$FINAL_OUTPUT_DIR/$output_filename"
+    else
+        final_output_path="$original_dir/$output_filename"
+    fi
+
+    if [ -n "$TRANSCODE_PATH" ]; then
+        temp_output_path="$TRANSCODE_PATH/$output_filename"
+    else
+        temp_output_path="$final_output_path"
+    fi
+
+    # --- Skip if Output Already Exists ---
+    if [ -f "$temp_output_path" ] || [ -f "$final_output_path" ]; then
+        echo "  → Output already exists ('$output_filename'). Skipping."
+        # Return claimed file if we moved it
+        if [ -n "$WORK_IN_PROGRESS_PATH" ] && [ "$DRY_RUN" = false ]; then
+            echo "  → Returning file to original location."
+            mv "$input_for_ffmpeg" "$filepath" || true
+        fi
+        (( COUNT_SKIPPED++ )) || true
+        continue
+    fi
+
+    # --- Dry Run Short-Circuit ---
+    if [ "$DRY_RUN" = true ]; then
+        echo "  [DRY RUN] Would transcode:"
+        echo "    Input  : $input_for_ffmpeg"
+        echo "    Temp   : $temp_output_path"
+        echo "    Final  : $final_output_path"
+        echo "    Action : $ACTION original"
+        (( COUNT_PROCESSED++ )) || true
+        continue
+    fi
+
+    # --- Transcode ---
+    echo "  → Transcoding: $filename → $output_filename"
+    [ -n "$TRANSCODE_PATH" ] && echo "     Temp path: $temp_output_path"
+
+    CURRENT_TEMP_FILE="$temp_output_path"
+    time_start=$(date +%s)
+
+    ffmpeg -nostdin \
+        $HW_OPTS \
+        -analyzeduration 20M \
+        -probesize 20M \
+        -i "$input_for_ffmpeg" \
+        -map 0:v:0 \
+        -map 0:a? \
+        -map 0:s? \
+        -map_chapters 0 \
+        -c:v "$VCODEC" $QUALITY_OPTS \
+        -vf "$VF_STRING" \
+        -c:a copy \
+        -c:s copy \
+        "$temp_output_path"
+
+    ffmpeg_exit=$?
+    CURRENT_TEMP_FILE=""
+    time_end=$(date +%s)
+    elapsed=$(( time_end - time_start ))
+    elapsed_fmt=$(printf '%02dh %02dm %02ds' $(( elapsed/3600 )) $(( (elapsed%3600)/60 )) $(( elapsed%60 )))
+
+    if [ $ffmpeg_exit -eq 0 ]; then
+        echo "  → Success. Elapsed: $elapsed_fmt"
+
+        # Handle original
+        case "$ACTION" in
+            delete)
+                echo "  → Deleting original: $input_for_ffmpeg"
+                rm "$input_for_ffmpeg"
+                ;;
+            move)
+                echo "  → Archiving original to: $MOVE_PATH/"
+                mv "$input_for_ffmpeg" "$MOVE_PATH/"
+                ;;
+        esac
+
+        # Move from temp to final if using a scratch directory
+        if [ -n "$TRANSCODE_PATH" ]; then
+            echo "  → Moving to final destination: $final_output_path"
+            mv "$temp_output_path" "$final_output_path"
+        fi
+
+        (( COUNT_PROCESSED++ )) || true
+
+    else
+        echo "  → FFmpeg FAILED (exit $ffmpeg_exit). Elapsed: $elapsed_fmt" >&2
+        echo "     Removing incomplete output: $temp_output_path"
+        rm -f "$temp_output_path"
+
+        # Return claimed file if WIP was used
+        if [ -n "$WORK_IN_PROGRESS_PATH" ]; then
+            echo "  → Returning file to original location."
+            mv "$input_for_ffmpeg" "$filepath" || true
+        fi
+
+        (( COUNT_FAILED++ )) || true
+    fi
+
+done < <(find "$TARGET_DIR" \
+    -type f \
+    -size +"${MIN_SIZE_GB}G" \
+    \( -name "*.mkv" -o -name "*.mp4" -o -name "*.avi" \
+       -o -name "*.mov" -o -name "*.ts"  -o -name "*.m2ts" \
+       -o -name "*.webm" \) \
+    ! -name "*_shrunk.mkv" \
+    -print0)
+
+# ===========================================================================
+# --- Final Summary ---
+# ===========================================================================
+echo ""
+echo "======================================================"
+echo "  Run Complete"
+echo "======================================================"
+echo "  Transcoded successfully : $COUNT_PROCESSED"
+echo "  Skipped (HDR)           : $COUNT_HDR"
+echo "  Skipped (exists/WIP)    : $COUNT_SKIPPED"
+echo "  Failed                  : $COUNT_FAILED"
+[ $COUNT_HDR -gt 0 ]   && echo "  HDR log                 : $HDR_LOG_FILE"
+[ "$DRY_RUN" = true ]   && echo "  *** DRY RUN — nothing was changed ***"
+echo "======================================================"
